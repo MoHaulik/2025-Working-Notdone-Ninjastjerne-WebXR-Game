@@ -1,0 +1,559 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>SHURIKEN AR</title>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+
+  <!-- Import Map for Three.js -->
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.150.1/build/three.module.js"
+    }
+  }
+  </script>
+
+  <style>
+    body { 
+      margin: 0; 
+      overflow: hidden;
+      font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
+      background-color: #000;
+    }
+    #overlay {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      z-index: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      background: rgba(0,0,0,0.7);
+      color: white;
+      text-align: center;
+    }
+    #start-button {
+      font-size: 24px;
+      padding: 20px 40px;
+      background: linear-gradient(145deg, #ff416c, #ff4b2b);
+      color: white;
+      border: none;
+      border-radius: 50px;
+      box-shadow: 0 8px 25px rgba(255, 65, 108, 0.5);
+      cursor: pointer;
+      transition: all 0.3s ease;
+      text-shadow: 0 2px 4px rgba(0,0,0,0.3);
+      border: 2px solid rgba(255,255,255,0.2);
+    }
+    #start-button:hover {
+      transform: scale(1.05);
+      box-shadow: 0 12px 35px rgba(255, 65, 108, 0.7);
+    }
+    .webxr-hidden {
+      display: none !important;
+    }
+    h1 {
+        font-size: 4rem;
+        margin-bottom: 0.5em;
+        text-shadow: 0 0 15px #ff416c, 0 0 20px #ff416c;
+    }
+  </style>
+</head>
+<body>
+  <div id="overlay">
+    <h1>🥷 SHURIKEN AR 🥷</h1>
+    <button id="start-button">START AR SESSION</button>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'three';
+
+    // --- Configuration ---
+    const CONFIG = {
+      ARENA: { distance: 1.7, width: 2.5, height: 1.8 },
+      TARGETS: { count: 8, size: 0.25, respawnTime: 3000 },
+      SHURIKEN: { size: 0.1, maxSpeed: 15, gravity: -5.0, spinRate: 40, throwMultiplier: 2.5 },
+      SCORING: { hitPoints: 100, comboBonus: 1.5 },
+      AUDIO: { throwGain: 0.2, hitGain: 0.4 }
+    };
+
+    // --- Global Variables ---
+    let camera, scene, renderer, clock;
+    let controllers = [];
+    let thrownShurikens = [];
+    let targets = [];
+    let score = 0;
+    let combo = 0;
+    let scoreDisplay, comboDisplay;
+    let audioCtx;
+
+    // --- Initialization ---
+    init();
+
+    function init() {
+      scene = new THREE.Scene();
+      camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 50);
+      clock = new THREE.Clock();
+
+      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.xr.enabled = true;
+      renderer.setClearColor(0x000000, 0); // For AR passthrough
+      document.body.appendChild(renderer.domElement);
+
+      const light = new THREE.DirectionalLight(0xffffff, 1.5);
+      light.position.set(1, 1, 1);
+      scene.add(light);
+      scene.add(new THREE.AmbientLight(0xffffff, 0.8));
+
+      document.getElementById('start-button').addEventListener('click', startARSession);
+      window.addEventListener('resize', onWindowResize);
+    }
+
+    // --- WebXR Session Management ---
+    async function startARSession() {
+      if (!navigator.xr) {
+        alert('WebXR not supported on this device.');
+        return;
+      }
+      try {
+        const session = await navigator.xr.requestSession('immersive-ar', {
+          requiredFeatures: ['local-floor'],
+        });
+        onSessionStarted(session);
+      } catch (error) {
+        alert('Failed to start AR session: ' + error.message);
+      }
+    }
+
+    function onSessionStarted(session) {
+      document.getElementById('overlay').classList.add('webxr-hidden');
+      renderer.xr.setReferenceSpaceType('local-floor');
+      renderer.xr.setSession(session);
+      
+      setupControllers();
+      spawnTargets();
+      createHUD();
+      initAudio();
+
+      renderer.setAnimationLoop(render);
+
+      session.addEventListener('end', onSessionEnd);
+    }
+
+    function onSessionEnd() {
+        document.getElementById('overlay').classList.remove('webxr-hidden');
+        renderer.setAnimationLoop(null);
+        // Clean up scene
+        thrownShurikens.forEach(s => scene.remove(s));
+        thrownShurikens = [];
+        targets.forEach(t => scene.remove(t.mesh));
+        targets = [];
+        controllers.forEach(c => scene.remove(c));
+        controllers = [];
+        scene.remove(scoreDisplay);
+        scene.remove(comboDisplay);
+    }
+
+    function onWindowResize() {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    }
+
+    // --- Controllers & Throwing ---
+    function setupControllers() {
+      for (let i = 0; i < 2; i++) {
+        const controller = renderer.xr.getController(i);
+        scene.add(controller);
+        controllers.push(controller);
+        
+        controller.userData.velocity = new THREE.Vector3();
+        controller.userData.lastPosition = new THREE.Vector3();
+
+        controller.addEventListener('selectstart', onSelectStart);
+        controller.addEventListener('selectend', onSelectEnd);
+      }
+    }
+
+    function onSelectStart(event) {
+        const controller = event.target;
+        if (controller.userData.shuriken) return; // Already holding one
+
+        const shuriken = createShuriken();
+        controller.add(shuriken);
+        controller.userData.shuriken = shuriken;
+    }
+
+    function onSelectEnd(event) {
+        const controller = event.target;
+        const shuriken = controller.userData.shuriken;
+        if (!shuriken) return;
+
+        controller.remove(shuriken);
+        scene.add(shuriken);
+
+        // Get world position and quaternion
+        const worldPosition = new THREE.Vector3();
+        const worldQuaternion = new THREE.Quaternion();
+        controller.getWorldPosition(worldPosition);
+        controller.getWorldQuaternion(worldQuaternion);
+        shuriken.position.copy(worldPosition);
+        shuriken.quaternion.copy(worldQuaternion);
+        
+        // Calculate velocity
+        const velocity = controller.userData.velocity.clone().multiplyScalar(CONFIG.SHURIKEN.throwMultiplier);
+
+        // Add small forward bias to prevent weak throws
+        const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(worldQuaternion);
+        velocity.add(forward.multiplyScalar(2)); // Minimum forward speed
+
+        if (velocity.length() > CONFIG.SHURIKEN.maxSpeed) {
+            velocity.normalize().multiplyScalar(CONFIG.SHURIKEN.maxSpeed);
+        }
+
+        shuriken.userData.velocity = velocity;
+        shuriken.userData.angularVelocity = new THREE.Vector3(0, 0, -CONFIG.SHURIKEN.spinRate * (velocity.length() / CONFIG.SHURIKEN.maxSpeed) - 5);
+        shuriken.userData.life = 3; // 3 seconds lifetime
+
+        thrownShurikens.push(shuriken);
+        controller.userData.shuriken = null;
+
+        playThrowSound();
+        triggerHaptics(controller, 0.8, 50);
+    }
+    
+    // --- Shuriken Creation ---
+    function createShuriken() {
+        const shape = new THREE.Shape();
+        const size = CONFIG.SHURIKEN.size;
+        shape.moveTo(0, size * 0.1);
+        shape.lineTo(size * 0.4, size * 0.4);
+        shape.lineTo(size * 0.1, 0);
+        shape.lineTo(size, -size * 0.1);
+        shape.lineTo(size * 0.6, -size * 0.4);
+        shape.lineTo(size * 0.9, -size);
+        shape.lineTo(0, -size * 0.8);
+        shape.lineTo(-size * 0.9, -size);
+        shape.lineTo(-size * 0.6, -size * 0.4);
+        shape.lineTo(-size, -size * 0.1);
+        shape.lineTo(-size * 0.1, 0);
+        shape.lineTo(-size * 0.4, size * 0.4);
+        shape.lineTo(0, size * 0.1);
+
+        const extrudeSettings = { depth: 0.01, bevelEnabled: false };
+        const geometry = new THREE.ExtrudeGeometry(shape, extrudeSettings);
+        geometry.center();
+        
+        const material = new THREE.MeshStandardMaterial({
+            color: 0xc0c0c0,
+            metalness: 0.9,
+            roughness: 0.2,
+            emissive: 0x111111
+        });
+
+        const shuriken = new THREE.Mesh(geometry, material);
+        shuriken.scale.set(0.5, 0.5, 0.5);
+
+        // Add glowing edges
+        const edges = new THREE.EdgesGeometry(geometry);
+        const lineMaterial = new THREE.LineBasicMaterial({ color: 0x00ffff, linewidth: 2 });
+        const line = new THREE.LineSegments(edges, lineMaterial);
+        shuriken.add(line);
+        
+        shuriken.userData.collider = new THREE.Sphere(shuriken.position, CONFIG.SHURIKEN.size * 0.5);
+
+        return shuriken;
+    }
+
+    // --- Target Management ---
+    function createTarget(position) {
+        const size = CONFIG.TARGETS.size;
+        const geometry = new THREE.BoxGeometry(size, size, 0.05);
+        const texture = createWoodTexture();
+        const material = new THREE.MeshStandardMaterial({ map: texture, roughness: 0.8 });
+        const mesh = new THREE.Mesh(geometry, material);
+        mesh.position.copy(position);
+        
+        const target = {
+            mesh: mesh,
+            collider: new THREE.Box3().setFromObject(mesh)
+        };
+        scene.add(mesh);
+        return target;
+    }
+    
+    function createWoodTexture() {
+        const canvas = document.createElement('canvas');
+        canvas.width = 256;
+        canvas.height = 256;
+        const context = canvas.getContext('2d');
+        
+        // Base color
+        context.fillStyle = '#8B4513'; // SaddleBrown
+        context.fillRect(0, 0, 256, 256);
+
+        // Wood grain
+        for (let i = 0; i < 50; i++) {
+            context.fillStyle = `rgba(0, 0, 0, ${Math.random() * 0.1})`;
+            context.fillRect(Math.random() * 256, 0, Math.random() * 5 + 1, 256);
+        }
+         for (let i = 0; i < 20; i++) {
+            context.strokeStyle = `rgba(0, 0, 0, ${Math.random() * 0.15})`;
+            context.lineWidth = Math.random() * 3;
+            context.beginPath();
+            context.moveTo(Math.random() * 256, 0);
+            context.bezierCurveTo(Math.random()*256, 85, Math.random()*256, 170, Math.random()*256, 256);
+            context.stroke();
+        }
+
+        return new THREE.CanvasTexture(canvas);
+    }
+
+    function spawnTargets() {
+        // Clear old targets
+        targets.forEach(t => scene.remove(t.mesh));
+        targets = [];
+
+        const { distance, width, height } = CONFIG.ARENA;
+        const count = CONFIG.TARGETS.count;
+        const rows = Math.ceil(Math.sqrt(count * (height/width)));
+        const cols = Math.ceil(count/rows);
+
+        const xSpacing = width / (cols);
+        const ySpacing = height / (rows);
+        
+        for (let i = 0; i < count; i++) {
+            const row = Math.floor(i/cols);
+            const col = i % cols;
+
+            const x = (col * xSpacing) - width / 2 + xSpacing/2;
+            const y = (row * ySpacing) - height / 2 + ySpacing/2 + 1.2; // Centered vertically
+            const z = -distance;
+            
+            targets.push(createTarget(new THREE.Vector3(x, y, z)));
+        }
+    }
+    
+    // --- HUD ---
+    function createHUD() {
+        scoreDisplay = createTextSprite("Score: 0", { x: -0.5, y: 1.8, z: -CONFIG.ARENA.distance });
+        comboDisplay = createTextSprite("Combo: 0", { x: 0.5, y: 1.8, z: -CONFIG.ARENA.distance });
+        scene.add(scoreDisplay);
+        scene.add(comboDisplay);
+    }
+
+    function createTextSprite(text, position) {
+        const canvas = document.createElement('canvas');
+        canvas.width = 512;
+        canvas.height = 128;
+        const context = canvas.getContext('2d');
+        context.font = "bold 60px Arial";
+        context.fillStyle = "white";
+        context.strokeStyle = 'black';
+        context.lineWidth = 8;
+        context.strokeText(text, 10, 80);
+        context.fillText(text, 10, 80);
+
+        const texture = new THREE.CanvasTexture(canvas);
+        const material = new THREE.SpriteMaterial({ map: texture });
+        const sprite = new THREE.Sprite(material);
+        sprite.position.set(position.x, position.y, position.z);
+        sprite.scale.set(1.0, 0.25, 1.0);
+        return sprite;
+    }
+    
+    function updateHUD() {
+        updateTextSprite(scoreDisplay, `Score: ${score}`);
+        updateTextSprite(comboDisplay, `Combo: ${combo}x`);
+    }
+
+    function updateTextSprite(sprite, text) {
+        const canvas = sprite.material.map.image;
+        const context = canvas.getContext('2d');
+        context.clearRect(0,0, canvas.width, canvas.height);
+        context.strokeText(text, 10, 80);
+        context.fillText(text, 10, 80);
+        sprite.material.map.needsUpdate = true;
+    }
+
+    // --- Audio & Haptics ---
+    function initAudio() {
+        if (window.AudioContext) {
+            audioCtx = new AudioContext();
+        }
+    }
+    
+    function playThrowSound() {
+        if (!audioCtx) return;
+        const oscillator = audioCtx.createOscillator();
+        const gainNode = audioCtx.createGain();
+
+        oscillator.type = 'white-noise';
+        gainNode.gain.setValueAtTime(CONFIG.AUDIO.throwGain, audioCtx.currentTime);
+        gainNode.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.2);
+
+        oscillator.connect(gainNode);
+        gainNode.connect(audioCtx.destination);
+        oscillator.start();
+        oscillator.stop(audioCtx.currentTime + 0.2);
+    }
+
+    function playHitSound() {
+        if (!audioCtx) return;
+        const oscillator = audioCtx.createOscillator();
+        const gainNode = audioCtx.createGain();
+
+        oscillator.type = 'sine';
+        oscillator.frequency.setValueAtTime(150, audioCtx.currentTime);
+        gainNode.gain.setValueAtTime(CONFIG.AUDIO.hitGain, audioCtx.currentTime);
+        gainNode.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.3);
+
+        oscillator.connect(gainNode);
+        gainNode.connect(audioCtx.destination);
+        oscillator.start();
+        oscillator.stop(audioCtx.currentTime + 0.3);
+    }
+    
+    function triggerHaptics(controller, intensity, duration) {
+        const gamepad = controller.gamepad;
+        if (gamepad && gamepad.hapticActuators && gamepad.hapticActuators.length > 0) {
+            gamepad.hapticActuators[0].pulse(intensity, duration);
+        }
+    }
+    
+    // --- Hit Effect ---
+    function createHitEffect(position) {
+        const geometry = new THREE.BufferGeometry();
+        const vertices = [];
+        const numParticles = 20;
+        for (let i = 0; i < numParticles; i++) {
+            vertices.push(0,0,0);
+        }
+        geometry.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
+        const material = new THREE.PointsMaterial({
+            color: 0xffff00,
+            size: 0.1,
+            transparent: true,
+            blending: THREE.AdditiveBlending
+        });
+
+        const particles = new THREE.Points(geometry, material);
+        particles.position.copy(position);
+        particles.userData.velocities = [];
+        particles.userData.life = 1.0;
+
+        for (let i = 0; i < numParticles; i++) {
+            particles.userData.velocities.push(
+                (Math.random() - 0.5) * 0.5,
+                (Math.random() - 0.5) * 0.5,
+                (Math.random() - 0.5) * 0.5,
+            );
+        }
+        scene.add(particles);
+        
+        // Add to a temporary list for animation
+        if (!scene.userData.effects) scene.userData.effects = [];
+        scene.userData.effects.push(particles);
+    }
+
+    // --- Game Loop ---
+    function render(time, frame) {
+        const delta = clock.getDelta();
+        
+        // Update Controllers
+        controllers.forEach(controller => {
+            const currentPosition = controller.position.clone();
+            if (controller.userData.lastPosition) {
+                controller.userData.velocity.subVectors(currentPosition, controller.userData.lastPosition).divideScalar(delta);
+            }
+            controller.userData.lastPosition.copy(currentPosition);
+        });
+
+        // Update Thrown Shurikens
+        for (let i = thrownShurikens.length - 1; i >= 0; i--) {
+            const shuriken = thrownShurikens[i];
+            
+            // Apply gravity
+            shuriken.userData.velocity.y += CONFIG.SHURIKEN.gravity * delta;
+            shuriken.position.add(shuriken.userData.velocity.clone().multiplyScalar(delta));
+
+            // Apply spin
+            shuriken.rotateOnAxis(new THREE.Vector3(0,0,1), shuriken.userData.angularVelocity.z * delta);
+
+            // Lifetime
+            shuriken.userData.life -= delta;
+            if (shuriken.userData.life <= 0) {
+                scene.remove(shuriken);
+                thrownShurikens.splice(i, 1);
+                combo = 0; // Reset combo on miss
+                updateHUD();
+                continue;
+            }
+
+            // Collision Detection
+            shuriken.userData.collider.center.copy(shuriken.position);
+            for (let j = targets.length - 1; j >= 0; j--) {
+                const target = targets[j];
+                if (target.collider.intersectsSphere(shuriken.userData.collider)) {
+                    // HIT!
+                    scene.remove(target.mesh);
+                    targets.splice(j, 1);
+                    
+                    scene.remove(shuriken);
+                    thrownShurikens.splice(i, 1);
+                    
+                    playHitSound();
+                    createHitEffect(target.mesh.position);
+                    
+                    // Score
+                    combo++;
+                    score += CONFIG.SCORING.hitPoints * (1 + (combo - 1) * CONFIG.SCORING.comboBonus);
+                    updateHUD();
+
+                    // Haptics on the throwing hand
+                    controllers.forEach(c => triggerHaptics(c, 1.0, 100));
+
+                    // Check for round end
+                    if(targets.length === 0) {
+                        setTimeout(spawnTargets, CONFIG.TARGETS.respawnTime);
+                    }
+                    
+                    break; // Stop checking targets for this shuriken
+                }
+            }
+        }
+        
+        // Update Effects
+        if(scene.userData.effects) {
+            for (let i = scene.userData.effects.length - 1; i >= 0; i--) {
+                const effect = scene.userData.effects[i];
+                effect.userData.life -= delta * 2;
+                if(effect.userData.life <= 0) {
+                    scene.remove(effect);
+                    scene.userData.effects.splice(i,1);
+                    continue;
+                }
+                const positions = effect.geometry.attributes.position.array;
+                for (let j = 0; j < positions.length; j += 3) {
+                    positions[j] += effect.userData.velocities[j] * delta;
+                    positions[j+1] += effect.userData.velocities[j+1] * delta;
+                    positions[j+2] += effect.userData.velocities[j+2] * delta;
+                }
+                effect.geometry.attributes.position.needsUpdate = true;
+                effect.material.opacity = effect.userData.life;
+            }
+        }
+
+
+        renderer.render(scene, camera);
+    }
+  </script>
+</body>
+</html>
